@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+#
+# alertmanager-backup-rules.sh
+#
+# WHAT THIS DOES
+#   Renders a Prometheus recording/alerting rules YAML file covering three
+#   backup SLO failure modes:
+#     1. Missed backups     - no backup attempt recorded within the expected window.
+#     2. RPO breach         - no *successful* backup within the committed RPO
+#                              (warning as it approaches, critical once breached).
+#     3. Capacity exhaustion- backup storage usage crossing warn/critical
+#                              thresholds, plus a predict_linear() alert that
+#                              fires before the volume actually fills up.
+#   Optionally validates the result with `promtool check rules` and can ask a
+#   running Prometheus to reload its config over HTTP.
+#
+# WHAT THIS ASSUMES
+#   - Backup jobs export the following metrics to Prometheus (via a pushgateway,
+#     textfile collector, or a custom exporter - naming is a convention, not a
+#     Prometheus built-in):
+#       backup_last_attempt_timestamp_seconds{...}   unix time of last run attempt
+#       backup_last_success_timestamp_seconds{...}   unix time of last successful run
+#       backup_storage_used_bytes{...}                bytes currently used
+#       backup_storage_capacity_bytes{...}            total bytes available
+#       backup_storage_free_bytes{...}                bytes currently free
+#     If your exporter uses different metric names, this script is not for you
+#     as-is - adjust the METRIC_* constants below.
+#   - `promtool` is only required if you pass --validate.
+#   - `curl` is only required if you pass --reload.
+#   - No hostnames, credentials, or file paths are baked in: everything comes
+#     from flags or environment variables, and secrets (bearer tokens) are read
+#     from an env var *name* you point at, never taken as a literal flag value.
+#
+# HOW TO RUN IT
+#   ./alertmanager-backup-rules.sh --output ./rules/backup-slo.yml --validate
+#
+#   # Filter to a specific Prometheus job and tighten RPO thresholds:
+#   ./alertmanager-backup-rules.sh \
+#     --job-selector 'job="nightly-db-backups"' \
+#     --rpo-warn-after 8h --rpo-critical-after 18h \
+#     --output ./rules/db-backup-slo.yml --validate
+#
+#   # Generate, validate, then ask Prometheus to hot-reload, using a bearer
+#   # token pulled from an env var (never pass tokens as a flag literal):
+#   export PROM_TOKEN='...'
+#   ./alertmanager-backup-rules.sh --output ./rules/backup-slo.yml \
+#     --validate --reload --prometheus-url https://prometheus.internal:9090 \
+#     --bearer-token-env PROM_TOKEN
+#
+#   # Preview without writing anything:
+#   ./alertmanager-backup-rules.sh --dry-run
+#
+#   # Machine-readable report of what happened (for CI pipelines):
+#   ./alertmanager-backup-rules.sh --output ./rules/backup-slo.yml --validate --json
+#
+#   See --help for the full flag/env-var reference.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+SCRIPT_NAME="$(basename "$0")"
+
+# --- fixed metric name conventions (edit here if your exporter differs) -----
+METRIC_LAST_ATTEMPT="backup_last_attempt_timestamp_seconds"
+METRIC_LAST_SUCCESS="backup_last_success_timestamp_seconds"
+METRIC_STORAGE_USED="backup_storage_used_bytes"
+METRIC_STORAGE_CAPACITY="backup_storage_capacity_bytes"
+METRIC_STORAGE_FREE="backup_storage_free_bytes"
+
+# --- defaults (all overridable by flag or env var) ---------------------------
+OUTPUT_PATH="${OUTPUT_PATH:-./backup-slo-rules.yml}"
+GROUP_NAME="${GROUP_NAME:-backup-slos}"
+EVAL_INTERVAL="${EVAL_INTERVAL:-1m}"
+JOB_SELECTOR="${JOB_SELECTOR:-}"                 # e.g. job="nightly-backups"
+MISSED_AFTER="${MISSED_AFTER:-26h}"
+RPO_WARN_AFTER="${RPO_WARN_AFTER:-12h}"
+RPO_CRITICAL_AFTER="${RPO_CRITICAL_AFTER:-24h}"
+CAPACITY_WARN_PERCENT="${CAPACITY_WARN_PERCENT:-80}"
+CAPACITY_CRITICAL_PERCENT="${CAPACITY_CRITICAL_PERCENT:-90}"
+CAPACITY_PREDICT_DAYS="${CAPACITY_PREDICT_DAYS:-7}"
+FOR_SHORT="${FOR_SHORT:-15m}"
+FOR_LONG="${FOR_LONG:-30m}"
+EXTRA_LABELS="${EXTRA_LABELS:-}"                 # comma-separated k=v pairs
+RUNBOOK_URL="${RUNBOOK_URL:-}"
+PROMTOOL_BIN="${PROMTOOL_BIN:-promtool}"
+PROMETHEUS_URL="${PROMETHEUS_URL:-}"
+BEARER_TOKEN_ENV=""                              # name of an env var holding a token; never the token itself
+
+DO_VALIDATE=0
+DO_RELOAD=0
+DO_DRY_RUN=0
+DO_JSON=0
+DO_FORCE=0
+
+DURATION_RE='^([0-9]+(ms|s|m|h|d|w|y))+$'
+PERCENT_RE='^[0-9]+$'
+INT_RE='^[0-9]+$'
+
+usage() {
+  cat <<EOF
+Usage: ${SCRIPT_NAME} [OPTIONS]
+
+Renders Prometheus alerting rules for backup SLOs (missed backups, RPO
+breach, capacity exhaustion) and optionally validates/reloads them.
+
+Output:
+  -o, --output PATH             Where to write the rules file.
+                                 (env: OUTPUT_PATH, default: ${OUTPUT_PATH})
+      --dry-run                 Print the rendered YAML to stdout, write nothing.
+      --force                   Overwrite --output if it already exists.
+      --json                    Emit a machine-readable JSON report instead of
+                                 human-readable text (ignored with --dry-run,
+                                 which always prints raw YAML).
+
+Rule content:
+      --group-name NAME         Rule group name. (env: GROUP_NAME, default: ${GROUP_NAME})
+      --eval-interval DUR       Group evaluation interval, e.g. 1m, 30s.
+                                 (env: EVAL_INTERVAL, default: ${EVAL_INTERVAL})
+      --job-selector EXPR       Raw PromQL label matcher body applied to every
+                                 metric, e.g. 'job="nightly-backups"'. Left
+                                 empty, alerts match all series for these
+                                 metrics. (env: JOB_SELECTOR)
+      --missed-backup-after DUR Alert if no backup *attempt* in this long.
+                                 (env: MISSED_AFTER, default: ${MISSED_AFTER})
+      --rpo-warn-after DUR      Warn if no *successful* backup in this long.
+                                 (env: RPO_WARN_AFTER, default: ${RPO_WARN_AFTER})
+      --rpo-critical-after DUR  Critical RPO breach threshold.
+                                 (env: RPO_CRITICAL_AFTER, default: ${RPO_CRITICAL_AFTER})
+      --capacity-warn-percent N   Storage used-% warning threshold.
+                                 (env: CAPACITY_WARN_PERCENT, default: ${CAPACITY_WARN_PERCENT})
+      --capacity-critical-percent N  Storage used-% critical threshold.
+                                 (env: CAPACITY_CRITICAL_PERCENT, default: ${CAPACITY_CRITICAL_PERCENT})
+      --capacity-predict-days N Fire if free space is predicted to hit zero
+                                 within this many days at current trend.
+                                 (env: CAPACITY_PREDICT_DAYS, default: ${CAPACITY_PREDICT_DAYS})
+      --for-short DUR           'for:' duration on fast-firing alerts.
+                                 (env: FOR_SHORT, default: ${FOR_SHORT})
+      --for-long DUR            'for:' duration on slower-confirming alerts.
+                                 (env: FOR_LONG, default: ${FOR_LONG})
+      --extra-labels K=V,K2=V2  Extra static labels applied to every alert,
+                                 e.g. team=platform,tier=1. (env: EXTRA_LABELS)
+      --runbook-url URL         Optional runbook_url annotation. (env: RUNBOOK_URL)
+
+Validation / reload:
+      --validate                 Run '\$PROMTOOL_BIN check rules' on the output.
+      --promtool-bin PATH        promtool binary to use. (env: PROMTOOL_BIN, default: promtool)
+      --reload                   POST to \$PROMETHEUS_URL/-/reload after writing.
+      --prometheus-url URL       Base URL of the Prometheus server. Required
+                                 with --reload. (env: PROMETHEUS_URL)
+      --bearer-token-env NAME    Name of an environment variable that holds a
+                                 bearer token to send with --reload. The token
+                                 value itself is never passed as a flag or
+                                 logged; only the variable *name* is.
+
+  -h, --help                     Show this help and exit.
+
+Nothing here is hardcoded to a specific host, credential, or file path -
+every value above comes from a flag or an environment variable, so the same
+script is safe to reuse across environments/customers.
+EOF
+}
+
+err() {
+  echo "ERROR: $*" >&2
+}
+
+die() {
+  err "$@"
+  exit 1
+}
+
+require_cmd() {
+  local cmd="$1" hint="$2"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    die "required tool '${cmd}' not found on PATH. ${hint}"
+  fi
+}
+
+validate_duration() {
+  local name="$1" value="$2"
+  [[ "$value" =~ $DURATION_RE ]] || die "--${name} must be a Prometheus duration like 30s/15m/2h/1d (got '${value}')"
+}
+
+validate_percent() {
+  local name="$1" value="$2"
+  [[ "$value" =~ $PERCENT_RE ]] || die "--${name} must be an integer percentage 0-100 (got '${value}')"
+  (( value >= 0 && value <= 100 )) || die "--${name} must be between 0 and 100 (got '${value}')"
+}
+
+validate_int() {
+  local name="$1" value="$2"
+  [[ "$value" =~ $INT_RE ]] || die "--${name} must be a positive integer (got '${value}')"
+  (( value > 0 )) || die "--${name} must be greater than 0 (got '${value}')"
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  printf '%s' "$s"
+}
+
+# --- argument parsing ---------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o|--output) OUTPUT_PATH="$2"; shift 2 ;;
+    --output=*) OUTPUT_PATH="${1#*=}"; shift ;;
+    --group-name) GROUP_NAME="$2"; shift 2 ;;
+    --eval-interval) EVAL_INTERVAL="$2"; shift 2 ;;
+    --job-selector) JOB_SELECTOR="$2"; shift 2 ;;
+    --missed-backup-after) MISSED_AFTER="$2"; shift 2 ;;
+    --rpo-warn-after) RPO_WARN_AFTER="$2"; shift 2 ;;
+    --rpo-critical-after) RPO_CRITICAL_AFTER="$2"; shift 2 ;;
+    --capacity-warn-percent) CAPACITY_WARN_PERCENT="$2"; shift 2 ;;
+    --capacity-critical-percent) CAPACITY_CRITICAL_PERCENT="$2"; shift 2 ;;
+    --capacity-predict-days) CAPACITY_PREDICT_DAYS="$2"; shift 2 ;;
+    --for-short) FOR_SHORT="$2"; shift 2 ;;
+    --for-long) FOR_LONG="$2"; shift 2 ;;
+    --extra-labels) EXTRA_LABELS="$2"; shift 2 ;;
+    --runbook-url) RUNBOOK_URL="$2"; shift 2 ;;
+    --validate) DO_VALIDATE=1; shift ;;
+    --promtool-bin) PROMTOOL_BIN="$2"; shift 2 ;;
+    --reload) DO_RELOAD=1; shift ;;
+    --prometheus-url) PROMETHEUS_URL="$2"; shift 2 ;;
+    --bearer-token-env) BEARER_TOKEN_ENV="$2"; shift 2 ;;
+    --dry-run) DO_DRY_RUN=1; shift ;;
+    --force) DO_FORCE=1; shift ;;
+    --json) DO_JSON=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) die "unknown argument: '$1' (see --help)" ;;
+  esac
+done
+
+# --- validate inputs -----------------------------------------------------------
+validate_duration "eval-interval" "$EVAL_INTERVAL"
+validate_duration "missed-backup-after" "$MISSED_AFTER"
+validate_duration "rpo-warn-after" "$RPO_WARN_AFTER"
+validate_duration "rpo-critical-after" "$RPO_CRITICAL_AFTER"
+validate_duration "for-short" "$FOR_SHORT"
+validate_duration "for-long" "$FOR_LONG"
+validate_percent "capacity-warn-percent" "$CAPACITY_WARN_PERCENT"
+validate_percent "capacity-critical-percent" "$CAPACITY_CRITICAL_PERCENT"
+validate_int "capacity-predict-days" "$CAPACITY_PREDICT_DAYS"
+
+if (( CAPACITY_WARN_PERCENT >= CAPACITY_CRITICAL_PERCENT )); then
+  die "--capacity-warn-percent (${CAPACITY_WARN_PERCENT}) must be less than --capacity-critical-percent (${CAPACITY_CRITICAL_PERCENT})"
+fi
+
+if [[ -z "$GROUP_NAME" ]]; then
+  die "--group-name must not be empty"
+fi
+
+if (( DO_RELOAD )); then
+  require_cmd curl "Install curl, or drop --reload and reload Prometheus another way."
+  [[ -n "$PROMETHEUS_URL" ]] || die "--reload requires --prometheus-url (or PROMETHEUS_URL env var)"
+fi
+
+BEARER_TOKEN=""
+if [[ -n "$BEARER_TOKEN_ENV" ]]; then
+  if [[ -z "${!BEARER_TOKEN_ENV:-}" ]]; then
+    die "--bearer-token-env points at '${BEARER_TOKEN_ENV}', but that environment variable is unset or empty"
+  fi
+  BEARER_TOKEN="${!BEARER_TOKEN_ENV}"
+fi
+
+if (( DO_VALIDATE )); then
+  require_cmd "$PROMTOOL_BIN" "Install Prometheus's promtool, or drop --validate. Override the binary path with --promtool-bin / PROMTOOL_BIN."
+fi
+
+# --- derive template values ---------------------------------------------------
+SELECTOR_EXPR=""
+if [[ -n "$JOB_SELECTOR" ]]; then
+  SELECTOR_EXPR="{${JOB_SELECTOR}}"
+fi
+
+CAPACITY_PREDICT_SECONDS=$(( CAPACITY_PREDICT_DAYS * 86400 ))
+
+EXTRA_LABELS_YAML=""
+if [[ -n "$EXTRA_LABELS" ]]; then
+  IFS=',' read -ra _pairs <<<"$EXTRA_LABELS"
+  first=1
+  for pair in "${_pairs[@]}"; do
+    key="${pair%%=*}"
+    val="${pair#*=}"
+    [[ -n "$key" && "$pair" == *"="* ]] || die "--extra-labels entry '${pair}' is not in KEY=VALUE form"
+    line="${key}: \"${val}\""
+    if (( first )); then
+      EXTRA_LABELS_YAML="$line"
+      first=0
+    else
+      EXTRA_LABELS_YAML="${EXTRA_LABELS_YAML}"$'\n'"          ${line}"
+    fi
+  done
+fi
+
+# --- render template -----------------------------------------------------------
+# Quoted heredoc: nothing in here is expanded by bash, so Prometheus's own
+# templating syntax ({{ $value }}, {{ $labels.foo }}) is preserved verbatim.
+# Placeholders use @@TOKEN@@ so they can never collide with Prometheus syntax.
+TEMPLATE=$(cat <<'YAML'
+groups:
+  - name: @@GROUP_NAME@@
+    interval: @@EVAL_INTERVAL@@
+    rules:
+      - alert: BackupAttemptMissed
+        expr: time() - @@METRIC_LAST_ATTEMPT@@@@SELECTOR@@ > @@MISSED_AFTER@@
+        for: @@FOR_SHORT@@
+        labels:
+          severity: critical
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup job has not run for {{ $labels.instance }}"
+          description: "No backup attempt has been recorded for {{ $labels.instance }} in over @@MISSED_AFTER@@ (current gap: {{ $value | humanizeDuration }}). Check the scheduler/job runner, not just the last backup result."
+          runbook_url: "@@RUNBOOK_URL@@"
+
+      - alert: BackupRPOWarning
+        expr: time() - @@METRIC_LAST_SUCCESS@@@@SELECTOR@@ > @@RPO_WARN@@
+        for: @@FOR_SHORT@@
+        labels:
+          severity: warning
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup RPO approaching breach for {{ $labels.instance }}"
+          description: "Last successful backup for {{ $labels.instance }} is {{ $value | humanizeDuration }} old, past the warning threshold of @@RPO_WARN@@. Investigate before it becomes an RPO breach."
+          runbook_url: "@@RUNBOOK_URL@@"
+
+      - alert: BackupRPOBreach
+        expr: time() - @@METRIC_LAST_SUCCESS@@@@SELECTOR@@ > @@RPO_CRIT@@
+        for: @@FOR_LONG@@
+        labels:
+          severity: critical
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup RPO breached for {{ $labels.instance }}"
+          description: "No successful backup for {{ $labels.instance }} in {{ $value | humanizeDuration }}, exceeding the committed RPO of @@RPO_CRIT@@. Data loss window is now larger than agreed SLO."
+          runbook_url: "@@RUNBOOK_URL@@"
+
+      - alert: BackupStorageCapacityWarning
+        expr: (@@METRIC_STORAGE_USED@@@@SELECTOR@@ / @@METRIC_STORAGE_CAPACITY@@@@SELECTOR@@) * 100 > @@CAP_WARN_PCT@@
+        for: @@FOR_SHORT@@
+        labels:
+          severity: warning
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup storage usage high for {{ $labels.instance }}"
+          description: "Backup storage for {{ $labels.instance }} is {{ $value | printf \"%.1f\" }}% full, above the @@CAP_WARN_PCT@@% warning threshold."
+          runbook_url: "@@RUNBOOK_URL@@"
+
+      - alert: BackupStorageCapacityCritical
+        expr: (@@METRIC_STORAGE_USED@@@@SELECTOR@@ / @@METRIC_STORAGE_CAPACITY@@@@SELECTOR@@) * 100 > @@CAP_CRIT_PCT@@
+        for: @@FOR_LONG@@
+        labels:
+          severity: critical
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup storage nearly full for {{ $labels.instance }}"
+          description: "Backup storage for {{ $labels.instance }} is {{ $value | printf \"%.1f\" }}% full, above the @@CAP_CRIT_PCT@@% critical threshold. New backups may soon fail to write."
+          runbook_url: "@@RUNBOOK_URL@@"
+
+      - alert: BackupStorageExhaustionPredicted
+        expr: predict_linear(@@METRIC_STORAGE_FREE@@@@SELECTOR@@[6h], @@PREDICT_SECONDS@@) < 0
+        for: @@FOR_LONG@@
+        labels:
+          severity: warning
+          slo: backup
+          @@EXTRA_LABELS@@
+        annotations:
+          summary: "Backup storage predicted to fill up for {{ $labels.instance }}"
+          description: "At the current growth rate, backup storage for {{ $labels.instance }} is predicted to be exhausted within @@PREDICT_DAYS@@ days. Plan capacity expansion or retention cleanup now."
+          runbook_url: "@@RUNBOOK_URL@@"
+YAML
+)
+
+RENDERED="$TEMPLATE"
+RENDERED="${RENDERED//@@GROUP_NAME@@/$GROUP_NAME}"
+RENDERED="${RENDERED//@@EVAL_INTERVAL@@/$EVAL_INTERVAL}"
+RENDERED="${RENDERED//@@METRIC_LAST_ATTEMPT@@/$METRIC_LAST_ATTEMPT}"
+RENDERED="${RENDERED//@@METRIC_LAST_SUCCESS@@/$METRIC_LAST_SUCCESS}"
+RENDERED="${RENDERED//@@METRIC_STORAGE_USED@@/$METRIC_STORAGE_USED}"
+RENDERED="${RENDERED//@@METRIC_STORAGE_CAPACITY@@/$METRIC_STORAGE_CAPACITY}"
+RENDERED="${RENDERED//@@METRIC_STORAGE_FREE@@/$METRIC_STORAGE_FREE}"
+RENDERED="${RENDERED//@@SELECTOR@@/$SELECTOR_EXPR}"
+RENDERED="${RENDERED//@@MISSED_AFTER@@/$MISSED_AFTER}"
+RENDERED="${RENDERED//@@RPO_WARN@@/$RPO_WARN_AFTER}"
+RENDERED="${RENDERED//@@RPO_CRIT@@/$RPO_CRITICAL_AFTER}"
+RENDERED="${RENDERED//@@CAP_WARN_PCT@@/$CAPACITY_WARN_PERCENT}"
+RENDERED="${RENDERED//@@CAP_CRIT_PCT@@/$CAPACITY_CRITICAL_PERCENT}"
+RENDERED="${RENDERED//@@PREDICT_SECONDS@@/$CAPACITY_PREDICT_SECONDS}"
+RENDERED="${RENDERED//@@PREDICT_DAYS@@/$CAPACITY_PREDICT_DAYS}"
+RENDERED="${RENDERED//@@FOR_SHORT@@/$FOR_SHORT}"
+RENDERED="${RENDERED//@@FOR_LONG@@/$FOR_LONG}"
+RENDERED="${RENDERED//@@RUNBOOK_URL@@/$RUNBOOK_URL}"
+RENDERED="${RENDERED//@@EXTRA_LABELS@@/$EXTRA_LABELS_YAML}"
+
+ALERT_NAMES=(BackupAttemptMissed BackupRPOWarning BackupRPOBreach BackupStorageCapacityWarning BackupStorageCapacityCritical BackupStorageExhaustionPredicted)
+
+# --- dry run: print and exit, nothing written or validated ---------------------
+if (( DO_DRY_RUN )); then
+  printf '%s\n' "$RENDERED"
+  exit 0
+fi
+
+# --- write output ----------------------------------------------------------------
+OUT_DIR="$(dirname "$OUTPUT_PATH")"
+mkdir -p "$OUT_DIR" || die "could not create output directory '${OUT_DIR}'"
+
+if [[ -e "$OUTPUT_PATH" && "$DO_FORCE" -eq 0 ]]; then
+  die "'${OUTPUT_PATH}' already exists. Pass --force to overwrite, or choose a different --output."
+fi
+
+printf '%s\n' "$RENDERED" > "$OUTPUT_PATH" || die "failed to write '${OUTPUT_PATH}'"
+ABS_OUTPUT_PATH="$(cd "$OUT_DIR" && pwd)/$(basename "$OUTPUT_PATH")"
+
+# --- validate --------------------------------------------------------------------
+VALIDATED="null"
+PROMTOOL_VERSION=""
+if (( DO_VALIDATE )); then
+  if ! VALIDATE_OUTPUT=$("$PROMTOOL_BIN" check rules "$OUTPUT_PATH" 2>&1); then
+    err "promtool rejected the generated rules file:"
+    echo "$VALIDATE_OUTPUT" >&2
+    die "generated file left at '${OUTPUT_PATH}' for inspection; fix inputs and re-run"
+  fi
+  VALIDATED="true"
+  PROMTOOL_VERSION="$("$PROMTOOL_BIN" --version 2>&1 | head -n1 || true)"
+fi
+
+# --- reload ------------------------------------------------------------------------
+RELOADED="null"
+if (( DO_RELOAD )); then
+  RELOAD_URL="${PROMETHEUS_URL%/}/-/reload"
+  CURL_ARGS=(-sS -o /dev/null -w '%{http_code}' -X POST "$RELOAD_URL")
+  if [[ -n "$BEARER_TOKEN" ]]; then
+    CURL_ARGS=(-H "Authorization: Bearer ${BEARER_TOKEN}" "${CURL_ARGS[@]}")
+  fi
+  HTTP_CODE="$(curl "${CURL_ARGS[@]}" || true)"
+  if [[ "$HTTP_CODE" != "200" ]]; then
+    die "reload request to '${RELOAD_URL}' failed (HTTP ${HTTP_CODE:-none}). Confirm --lifecycle-web.enable-admin-api or --web.enable-lifecycle is set on Prometheus, and that the URL/credentials are correct."
+  fi
+  RELOADED="true"
+fi
+
+GENERATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- report ------------------------------------------------------------------------
+if (( DO_JSON )); then
+  alerts_json=""
+  for name in "${ALERT_NAMES[@]}"; do
+    if [[ -n "$alerts_json" ]]; then alerts_json+=","; fi
+    alerts_json+="\"$(json_escape "$name")\""
+  done
+  printf '{\n'
+  printf '  "output": "%s",\n' "$(json_escape "$ABS_OUTPUT_PATH")"
+  printf '  "group_name": "%s",\n' "$(json_escape "$GROUP_NAME")"
+  printf '  "alerts": [%s],\n' "$alerts_json"
+  printf '  "validated": %s,\n' "$VALIDATED"
+  printf '  "promtool_version": "%s",\n' "$(json_escape "$PROMTOOL_VERSION")"
+  printf '  "reloaded": %s,\n' "$RELOADED"
+  printf '  "generated_at": "%s"\n' "$GENERATED_AT"
+  printf '}\n'
+else
+  echo "Wrote ${#ALERT_NAMES[@]} alert rules to: ${ABS_OUTPUT_PATH}"
+  echo "  group: ${GROUP_NAME}  (eval interval ${EVAL_INTERVAL})"
+  for name in "${ALERT_NAMES[@]}"; do
+    echo "  - ${name}"
+  done
+  if (( DO_VALIDATE )); then
+    echo "promtool check rules: PASSED (${PROMTOOL_VERSION:-unknown version})"
+  else
+    echo "Not validated - re-run with --validate before deploying."
+  fi
+  if (( DO_RELOAD )); then
+    echo "Prometheus at ${PROMETHEUS_URL} reloaded successfully."
+  fi
+fi
